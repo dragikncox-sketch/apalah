@@ -3,7 +3,8 @@ import asyncio
 import logging
 import random
 import sqlite3
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 
 from telegram import (
     Update,
@@ -21,7 +22,12 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN, ADMIN_USERNAME
-from database import init_sms_database, save_number_owner, get_number_owner, normalize_number
+from database import (
+    init_sms_database,
+    save_number_owner,
+    get_number_owner,
+    normalize_number,
+)
 from sms_forwarder import sms_poll_loop
 from augestel import (
     get_all_numbers,
@@ -44,13 +50,150 @@ logger = logging.getLogger(__name__)
 NUMBERS_PER_REQUEST = 3
 DATABASE = "users.db"
 
+REQUIRED_GROUP_ID = int(
+    os.getenv("REQUIRED_GROUP_ID", "-1004387643125")
+)
+
+REQUIRED_GROUP_LINK = os.getenv(
+    "REQUIRED_GROUP_LINK",
+    "https://t.me/+2xpSHUjQfmM3ZWM1",
+)
+
+REQUIRED_CHANNEL_ID = int(
+    os.getenv("REQUIRED_CHANNEL_ID", "-1004363973467")
+)
+
+REQUIRED_CHANNEL_LINK = os.getenv(
+    "REQUIRED_CHANNEL_LINK",
+    "https://t.me/+hBeB1LSE3W4zZGM1",
+)
+
 COUNTRIES = {
     "indonesia": "INDONESIA",
     "malaysia": "MALAYSIA",
     "philippines": "PHILIPPINES",
     "myanmar": "MYANMAR",
-    "pakistan": "PAKISTAN",
 }
+
+
+# =====================================
+# SAFE TELEGRAM MESSAGE EDIT
+# =====================================
+
+async def safe_edit_message(query, text, **kwargs):
+    try:
+        return await query.edit_message_text(
+            text=text,
+            **kwargs
+        )
+
+    except BadRequest as error:
+        if "Message is not modified" in str(error):
+            logger.info("Pesan tidak mengalami perubahan.")
+            return None
+
+        raise
+
+
+# =====================================
+# GROUP + CHANNEL MEMBERSHIP
+# =====================================
+
+def membership_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 JOIN GROUP", url=REQUIRED_GROUP_LINK)],
+        [InlineKeyboardButton("📢 JOIN CHANNEL", url=REQUIRED_CHANNEL_LINK)],
+        [InlineKeyboardButton("🔄 CEK KEANGGOTAAN", callback_data="check_membership")],
+    ])
+
+
+async def check_chat_membership(bot, chat_id, user_id, chat_label):
+    try:
+        member = await bot.get_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+
+        if member.status in ("creator", "administrator", "member"):
+            return True
+
+        if member.status == "restricted":
+            return bool(member.is_member)
+
+        return False
+
+    except TelegramError:
+        logger.exception(
+            "Gagal memeriksa keanggotaan %s (chat_id=%s).",
+            chat_label,
+            chat_id,
+        )
+        return None
+
+
+async def check_required_memberships(bot, user_id):
+    """True jika user join grup DAN channel; None jika pemeriksaan gagal."""
+    group_member = await check_chat_membership(
+        bot, REQUIRED_GROUP_ID, user_id, "grup"
+    )
+    channel_member = await check_chat_membership(
+        bot, REQUIRED_CHANNEL_ID, user_id, "channel"
+    )
+
+    if group_member is False or channel_member is False:
+        return False
+    if group_member is None or channel_member is None:
+        return None
+    return True
+
+
+async def send_membership_message(message):
+    await message.reply_text(
+        "🔒 <b>AKSES BOT TERKUNCI</b>\n\n"
+        "Untuk menggunakan JING OTP BOT, kamu wajib bergabung "
+        "ke grup DAN channel Telegram kami.\n\n"
+        "1. Tekan JOIN GROUP.\n"
+        "2. Tekan JOIN CHANNEL.\n"
+        "3. Setelah bergabung ke keduanya, tekan CEK KEANGGOTAAN.",
+        parse_mode="HTML",
+        reply_markup=membership_keyboard(),
+    )
+
+
+async def verify_user_access(update, context):
+    user = update.effective_user
+    if not user:
+        return False
+
+    is_member = await check_required_memberships(context.bot, user.id)
+    if is_member is True:
+        return True
+
+    if update.callback_query:
+        text = (
+            "⚠️ Pemeriksaan keanggotaan gagal. Pastikan bot menjadi admin "
+            "channel dan anggota grup, lalu coba lagi."
+            if is_member is None else
+            "🔒 <b>AKSES BOT TERKUNCI</b>\n\n"
+            "Kamu wajib bergabung ke grup DAN channel terlebih dahulu."
+        )
+        await safe_edit_message(
+            update.callback_query,
+            text,
+            parse_mode="HTML",
+            reply_markup=membership_keyboard(),
+        )
+    elif update.effective_message:
+        if is_member is None:
+            await update.effective_message.reply_text(
+                "⚠️ Tidak dapat memeriksa keanggotaan grup/channel. "
+                "Pastikan bot adalah admin channel dan anggota grup, lalu coba lagi.",
+                reply_markup=membership_keyboard(),
+            )
+        else:
+            await send_membership_message(update.effective_message)
+    return False
+
 
 # =====================================
 # DATABASE
@@ -135,7 +278,6 @@ def get_total_users():
 async def get_total_sms():
     try:
         result = await get_statistics()
-
         summary = result.get("summary", {})
 
         return summary.get("total_messages", 0)
@@ -217,12 +359,6 @@ def country_menu():
         ],
         [
             InlineKeyboardButton(
-                "🇵🇰 Pakistan",
-                callback_data="country:pakistan",
-            )
-        ],
-        [
-            InlineKeyboardButton(
                 "⬅️ Kembali",
                 callback_data="get_number",
             )
@@ -236,10 +372,15 @@ def country_menu():
 
 def build_number_keyboard(numbers):
     keyboard = []
+
     for item in numbers:
-        number = normalize_number(item.get("number", ""))
+        number = normalize_number(
+            item.get("number", "")
+        )
+
         if not number:
             continue
+
         keyboard.append([
             InlineKeyboardButton(
                 f"📱 {item.get('number', number)}",
@@ -248,11 +389,19 @@ def build_number_keyboard(numbers):
         ])
 
     keyboard.append([
-        InlineKeyboardButton("🟢 GANTI NOMOR", callback_data="next_numbers")
+        InlineKeyboardButton(
+            "🟢 GANTI NOMOR",
+            callback_data="next_numbers",
+        )
     ])
+
     keyboard.append([
-        InlineKeyboardButton("🔵 MENU UTAMA", callback_data="home")
+        InlineKeyboardButton(
+            "🔵 MENU UTAMA",
+            callback_data="home",
+        )
     ])
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -266,13 +415,17 @@ def filter_numbers(numbers, country):
     aliases = {
         "INDONESIA": ["INDONESIA"],
         "MALAYSIA": ["MALAYSIA"],
-        "PHILIPPINES": ["PHILIPPINES", "PHILIPPINE"],
-        "MYANMAR": ["MYANMAR", "BURMA"],
-        "PAKISTAN": ["PAKISTAN"],
+        "PHILIPPINES": [
+            "PHILIPPINES",
+            "PHILIPPINE",
+        ],
+        "MYANMAR": [
+            "MYANMAR",
+            "BURMA",
+        ],
     }
 
     keywords = aliases.get(keyword, [keyword])
-
     filtered = []
 
     for item in numbers:
@@ -293,9 +446,11 @@ def filter_numbers(numbers, country):
 # START
 # =====================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+async def start(update, context):
+    if not await verify_user_access(update, context):
+        return
 
+    user = update.effective_user
     register_user(user)
 
     total_users = get_total_users()
@@ -311,7 +466,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Silakan pilih menu di bawah."
     )
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         text,
         parse_mode="HTML",
         reply_markup=main_menu(),
@@ -322,13 +477,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # CANCEL
 # =====================================
 
-async def cancel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def cancel_command(update, context):
+    if not await verify_user_access(update, context):
+        return
+
     context.user_data.clear()
 
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "✅ Proses dibatalkan.",
         reply_markup=main_menu(),
     )
@@ -339,17 +494,16 @@ async def cancel_command(
 # =====================================
 
 async def send_number_list(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    country: str,
+    update,
+    context,
+    country,
 ):
     query = update.callback_query
 
     try:
-        await query.answer()
-
-        await query.edit_message_text(
-            "⏳ Loading..."
+        await safe_edit_message(
+            query,
+            "⏳ Loading...",
         )
 
         all_numbers = await get_all_numbers()
@@ -360,7 +514,8 @@ async def send_number_list(
         )
 
         if not filtered:
-            await query.edit_message_text(
+            await safe_edit_message(
+                query,
                 f"❌ Tidak ada nomor tersedia untuk "
                 f"{COUNTRIES[country]}.",
                 reply_markup=country_menu(),
@@ -380,7 +535,8 @@ async def send_number_list(
         logger.exception("Gagal mengambil nomor")
 
         try:
-            await query.edit_message_text(
+            await safe_edit_message(
+                query,
                 "❌ Gagal mengambil nomor.\n"
                 "Silakan coba kembali.",
                 reply_markup=country_menu(),
@@ -395,15 +551,17 @@ async def send_number_list(
 
 async def send_next_three(
     query,
-    context: ContextTypes.DEFAULT_TYPE,
+    context,
     edit_message=True,
 ):
     all_numbers = context.user_data.get(
-        "numbers", []
+        "numbers",
+        [],
     )
 
     if not all_numbers:
-        await query.edit_message_text(
+        await safe_edit_message(
+            query,
             "Silakan pilih negara kembali.",
             reply_markup=country_menu(),
         )
@@ -411,11 +569,13 @@ async def send_next_three(
 
     if len(all_numbers) <= NUMBERS_PER_REQUEST:
         selected = list(all_numbers)
+
     else:
         previous = {
             str(item.get("number", ""))
             for item in context.user_data.get(
-                "current_numbers", []
+                "current_numbers",
+                [],
             )
         }
 
@@ -435,11 +595,13 @@ async def send_next_three(
     context.user_data["current_numbers"] = selected
 
     country = context.user_data.get(
-        "selected_country", ""
+        "selected_country",
+        "",
     )
 
     country_name = COUNTRIES.get(
-        country, country.upper()
+        country,
+        country.upper(),
     )
 
     remaining = max(
@@ -454,46 +616,107 @@ async def send_next_three(
         f"📦 Total tersedia: <b>{len(all_numbers)}</b>\n"
         f"🔢 Sisa pilihan: <b>{remaining}</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🟢 <i>Tekan PILIH pada nomor yang ingin kamu gunakan Untuk Mendapatkan OTP.\n"
-        "Tunggu Beberapa detik untuk menerima OTP.</i>"
+        "🟢 <i>Tekan PILIH pada nomor yang ingin kamu gunakan.\n"
+        "Nomor akan ditautkan ke akun Telegram kamu.</i>"
     )
 
     keyboard = build_number_keyboard(selected)
 
-    try:
-        await query.edit_message_text(
-            text=message,
-            parse_mode="HTML",
-            reply_markup=keyboard,
+    await safe_edit_message(
+        query,
+        message,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+# =====================================
+# MEMBERSHIP CHECK CALLBACK
+# =====================================
+
+async def handle_membership_check(update, context):
+    query = update.callback_query
+    user = update.effective_user
+
+    is_member = await check_required_memberships(context.bot, user.id)
+
+    if is_member is True:
+        register_user(user)
+
+        total_users = get_total_users()
+        total_sms = await get_total_sms()
+
+        welcome_text = (
+            "👋 <b>SELAMAT DATANG DI JING OTP BOT</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📊 <b>STATISTIK BOT</b>\n"
+            f"👥 Total pengguna: <b>{total_users:,}</b>\n"
+            f"💬 Total SMS: <b>{total_sms}</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Silakan pilih menu di bawah."
         )
 
-    except BadRequest as error:
-        if "Message is not modified" not in str(error):
-            raise
+        await safe_edit_message(
+            query,
+            welcome_text,
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+
+    elif is_member is False:
+        await safe_edit_message(
+            query,
+            "🔒 <b>AKSES BOT TERKUNCI</b>\n\n"
+            "Kamu belum bergabung ke grup dan/atau channel kami.\n"
+            "Silakan bergabung ke keduanya, lalu cek kembali.",
+            parse_mode="HTML",
+            reply_markup=membership_keyboard(),
+        )
+
+    else:
+        await safe_edit_message(
+            query,
+            "⚠️ Tidak dapat memeriksa keanggotaan.\n"
+            "Pastikan bot menjadi admin channel dan anggota grup, lalu coba lagi.",
+            reply_markup=membership_keyboard(),
+        )
 
 
 # =====================================
 # BUTTON HANDLER
 # =====================================
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def button_handler(update, context):
     query = update.callback_query
     data = query.data
 
     try:
         await query.answer()
-
     except TelegramError:
-        logger.warning("Callback sudah kedaluwarsa: %s", data)
+        logger.warning(
+            "Callback sudah kedaluwarsa: %s",
+            data,
+        )
+
+    # Tombol pengecekan grup harus diproses sebelum gate.
+    if data == "check_membership":
+        await handle_membership_check(
+            update,
+            context,
+        )
+        return
+
+    # Semua tombol lainnya wajib melewati pengecekan grup.
+    if not await verify_user_access(update, context):
+        return
 
     if data == "home":
         context.user_data.clear()
 
-        await query.edit_message_text(
-            "🏠 <b>MENU UTAMA</b>\n\nSilakan pilih menu:",
+        await safe_edit_message(
+            query,
+            "🏠 <b>MENU UTAMA</b>\n\n"
+            "Silakan pilih menu:",
             parse_mode="HTML",
             reply_markup=main_menu(),
         )
@@ -501,25 +724,22 @@ async def button_handler(
     elif data == "cancel":
         context.user_data.clear()
 
-        await query.edit_message_text(
+        await safe_edit_message(
+            query,
             "✅ Proses dibatalkan.",
             reply_markup=main_menu(),
         )
 
     elif data == "get_number":
-        try:
-            await query.edit_message_text(
-                "📱 SILAKAN PILIH LAYANAN:",
-                reply_markup=service_menu(),
-            )
-        except BadRequest as error:
-            # Telegram raises this when the message already has identical
-            # text and buttons. It is safe to ignore this specific case.
-            if "Message is not modified" not in str(error):
-                raise
+        await safe_edit_message(
+            query,
+            "📱 SILAKAN PILIH LAYANAN:",
+            reply_markup=service_menu(),
+        )
 
     elif data == "service_whatsapp":
-        await query.edit_message_text(
+        await safe_edit_message(
+            query,
             "🌍 PILIH NEGARA:",
             reply_markup=country_menu(),
         )
@@ -537,24 +757,39 @@ async def button_handler(
         )
 
     elif data.startswith("select_number:"):
-        number = normalize_number(data.split(":", 1)[1])
+        number = normalize_number(
+            data.split(":", 1)[1]
+        )
+
         user_id = update.effective_user.id
-        owner_id = save_number_owner(user_id, number)
+
+        owner_id = save_number_owner(
+            user_id,
+            number,
+        )
 
         if owner_id != user_id:
             await query.message.reply_text(
-                "❌ Nomor ini sudah ditautkan ke pengguna lain. Silakan pilih nomor berbeda."
+                "❌ Nomor ini sudah ditautkan ke "
+                "pengguna lain. Silakan pilih nomor berbeda."
             )
             return
 
         await query.message.reply_text(
-            f"✅ Nomor <b>{number}</b> berhasil ditautkan ke akun kamu.\n\n"
-            "SMS masuk untuk nomor ini akan diteruskan ke chat bot ini.\n"
+            f"✅ Nomor <b>{number}</b> berhasil ditautkan "
+            "ke akun kamu.\n\n"
+            "SMS masuk untuk nomor ini akan diteruskan "
+            "ke chat bot ini.\n"
             "Pastikan kamu sudah menekan /start.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[ 
-                InlineKeyboardButton("📋 SALIN NOMOR", copy_text=CopyTextButton(text=number))
-            ]]),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📋 SALIN NOMOR",
+                        copy_text=CopyTextButton(text=number),
+                    )
+                ]
+            ]),
         )
 
     elif data == "next_numbers":
@@ -569,11 +804,8 @@ async def button_handler(
 # ERROR HANDLER
 # =====================================
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logger.exception(
+async def error_handler(update, context):
+    logger.error(
         "Terjadi kesalahan:",
         exc_info=context.error,
     )
@@ -584,13 +816,19 @@ async def error_handler(
 # =====================================
 
 async def post_init(application):
+    # ID grup wajib tersedia sebelum SMS forwarder mulai berjalan.
+    application.bot_data["required_group_id"] = REQUIRED_GROUP_ID
+    application.bot_data["required_channel_id"] = REQUIRED_CHANNEL_ID
+
     init_database()
     init_sms_database()
 
     try:
         await start_cache(application)
     except Exception:
-        logger.exception("Cache awal gagal dimuat")
+        logger.exception(
+            "Cache awal gagal dimuat"
+        )
 
     application.bot_data["sms_poll_task"] = asyncio.create_task(
         sms_poll_loop(application),
@@ -599,13 +837,18 @@ async def post_init(application):
 
 
 async def post_shutdown(application):
-    task = application.bot_data.get("sms_poll_task")
+    task = application.bot_data.get(
+        "sms_poll_task"
+    )
+
     if task is not None:
         task.cancel()
+
         try:
             await task
         except asyncio.CancelledError:
             pass
+
     await stop_cache(application)
 
 
@@ -641,9 +884,13 @@ def main():
         CallbackQueryHandler(button_handler)
     )
 
-    application.add_error_handler(error_handler)
+    application.add_error_handler(
+        error_handler
+    )
 
-    logger.info("JING OTP Bot berjalan...")
+    logger.info(
+        "JING OTP Bot berjalan..."
+    )
 
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
