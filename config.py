@@ -15,6 +15,13 @@ REQUIRED_GROUP_LINK = os.getenv(
     "REQUIRED_GROUP_LINK",
     "https://t.me/+2xpSHUjQfmM3ZWM1"
 )
+REQUIRED_GROUP_ID = int(
+    os.getenv("REQUIRED_GROUP_ID", "-1004363973467")
+)
+REQUIRED_GROUP_LINK = os.getenv(
+    "REQUIRED_GROUP_LINK",
+    "https://t.me/+hBeB1LSE3W4zZGM1"
+)
 
 # AUGESTEL API
 API_KEY = os.getenv("API_KEY", "")
