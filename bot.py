@@ -73,6 +73,7 @@ COUNTRIES = {
     "malaysia": "MALAYSIA",
     "philippines": "PHILIPPINES",
     "myanmar": "MYANMAR",
+    "pakistan": "PAKISTAN",
 }
 
 
@@ -357,6 +358,12 @@ def country_menu():
                 callback_data="country:myanmar",
             )
         ],
+                [
+            InlineKeyboardButton(
+                "🇵🇰 Pakistan",
+                callback_data="country:pakistan",
+            )
+        ],
         [
             InlineKeyboardButton(
                 "⬅️ Kembali",
@@ -422,6 +429,9 @@ def filter_numbers(numbers, country):
         "MYANMAR": [
             "MYANMAR",
             "BURMA",
+        ],
+        "PAKISTAN": [
+            "PAKISTAN",
         ],
     }
 
