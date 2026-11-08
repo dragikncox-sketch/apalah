@@ -807,6 +807,9 @@ async def error_handler(update, context):
 # =====================================
 
 async def post_init(application):
+    # ID grup wajib tersedia sebelum SMS forwarder mulai berjalan.
+    application.bot_data["required_group_id"] = REQUIRED_GROUP_ID
+
     init_database()
     init_sms_database()
 
